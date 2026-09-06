@@ -37,11 +37,11 @@ jobs:
         run: |
           HOUR=$(date -u +%H)
           case $HOUR in
-            20|21) RUN=00 ;;
+            20|21|17) RUN=00 ;;
           esac
-          YEAR=$(date -u +%Y)
-          MONTH=$(date -u +%m)
-          DAY=$(date -u +%d)
+          YEAR="2026"
+          MONTH="09"
+          DAY="05"
           DATE=$(date -u +%Y%m%d)
           # set env variables
           echo "RUN=$RUN" >> $GITHUB_ENV
@@ -105,11 +105,13 @@ jobs:
         run: |
           mkdir -p ec46/${{ matrix.variable }}
           input_dir="data/${{ matrix.variable }}"
+          spread_dir="data/$(echo ${{ matrix.variable }} | sed 's/_mean/_spread/')"
           script="scripts/generate_pngs.py"
           python "$script" \
             "$input_dir" \
             ec46/${{ matrix.variable }} \
-            ${{ matrix.variable }}
+            ${{ matrix.variable }} \
+            "$spread_dir"
 
 
       - name: Upload PNGs artifact
