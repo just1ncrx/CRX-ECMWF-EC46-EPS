@@ -1,0 +1,171 @@
+name: Fetch EC46 OM File and Generate Webp
+
+on:
+  workflow_dispatch:
+
+jobs:
+  fetch_and_generate:
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.set_run_date.outputs.run }}
+
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v3
+        with:
+          token: ${{ secrets.EC46_PAT }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+
+      - name: Cache Python packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+      
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Set RUN and DATE
+        id: set_run_date
+        run: |
+          HOUR=$(date -u +%H)
+          case $HOUR in
+            20|21) RUN=00 ;;
+          esac
+          YEAR=$(date -u +%Y)
+          MONTH=$(date -u +%m)
+          DAY=$(date -u +%d)
+          DATE=$(date -u +%Y%m%d)
+          # set env variables
+          echo "RUN=$RUN" >> $GITHUB_ENV
+          echo "YEAR=$YEAR" >> $GITHUB_ENV
+          echo "MONTH=$MONTH" >> $GITHUB_ENV
+          echo "DAY=$DAY" >> $GITHUB_ENV
+          echo "DATE=$DATE" >> $GITHUB_ENV
+          # set step output for job output
+          echo "run=$RUN" >> $GITHUB_OUTPUT
+
+      - name: Download OM files from Open-Meteo S3
+        run: |
+          mkdir -p data/t2m_mean data/wind_mean data/t2m_spread data/wind_spread
+
+          BASE_URL="https://openmeteo.s3.amazonaws.com/data_run/ecmwf_ec46_ensemble_mean/${YEAR}/${MONTH}/${DAY}/${RUN}00Z"
+
+          echo "Lade von: $BASE_URL"
+
+          curl -fSL "${BASE_URL}/temperature_2m.om" -o "data/t2m_mean/temperature_2m.om"
+          curl -fSL "${BASE_URL}/wind_gusts_10m.om" -o "data/wind_mean/wind_gusts_10m.om"
+          curl -fSL "${BASE_URL}/temperature_2m_spread.om" -o "data/t2m_spread/temperature_2m_spread.om"
+          curl -fSL "${BASE_URL}/wind_gusts_10m_spread.om" -o "data/wind_spread/wind_gusts_10m_spread.om"
+
+          
+      - name: Upload data as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: om-file
+          path: data/
+
+      - name: Delete data files (local cleanup)
+        run: rm -rf data/
+
+
+  generate_pngs:
+    runs-on: ubuntu-latest
+    needs: fetch_and_generate
+    strategy:
+      matrix:
+        variable: [t2m_mean, wind_mean, t2m_spread, wind_spread]
+      max-parallel: 4
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download GRIB2 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: om-file
+          path: data/
+
+      - name: Generate PNGs for ${{ matrix.variable }}
+        run: |
+          mkdir -p ec46/${{ matrix.variable }}
+          input_dir="data/${{ matrix.variable }}"
+          script="scripts/generate_pngs.py"
+          python "$script" \
+            "$input_dir" \
+            ec46/${{ matrix.variable }} \
+            ${{ matrix.variable }}
+
+
+      - name: Upload PNGs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ec46-${{ matrix.variable }}
+          path: ec46/${{ matrix.variable }}
+
+  deploy_to_r2:
+    runs-on: ubuntu-latest
+    needs: [fetch_and_generate, generate_pngs]
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v3
+
+      - name: Download all PNGs artifact
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ec46-*
+          path: ec46_raw
+
+      - name: Merge PNG folders into one structure
+        run: |
+          mkdir -p ec46/${{ needs.fetch_and_generate.outputs.run }}
+          for d in ec46_raw/*; do
+            if [ -d "$d" ]; then
+              varname=$(basename "$d" | sed 's/^ec46-//')  # entfernt "ec46-" Prefix
+              mkdir -p ec46/${{ needs.fetch_and_generate.outputs.run }}/"$varname"
+              cp -r "$d"/* ec46/${{ needs.fetch_and_generate.outputs.run }}/"$varname"/ || true
+            fi
+          done
+
+      - name: Generate Metadata
+        run: |
+          python scripts/generate_metadata.py ec46/${{ needs.fetch_and_generate.outputs.run }} ${{ needs.fetch_and_generate.outputs.run }} ${{ env.DATE }}
+
+      - name: Clean old runs on R2 except current
+        run: |
+          for run_folder in $(aws s3 ls s3://${{ secrets.R2_BUCKET }}/ec46/ --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com | awk '{print $2}' | sed 's#/##'); do
+            if [ "$run_folder" != "${{ needs.fetch_and_generate.outputs.run }}/" ]; then
+              aws s3 rm s3://${{ secrets.R2_BUCKET }}/ec46/$run_folder --recursive --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+            fi
+          done
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+
+      - name: Upload current run and metadata.json to R2
+        run: |
+          # Upload run folder
+          aws s3 sync ./ec46/${{ needs.fetch_and_generate.outputs.run }}/ s3://${{ secrets.R2_BUCKET }}/ec46/${{ needs.fetch_and_generate.outputs.run }}/ \
+            --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+
+          # Upload metadata.json outside run folder
+          aws s3 cp ./ec46/metadata.json s3://${{ secrets.R2_BUCKET }}/ec46/metadata.json \
+            --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
