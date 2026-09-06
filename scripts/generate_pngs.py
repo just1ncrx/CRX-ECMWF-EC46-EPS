@@ -19,7 +19,11 @@ from omfiles import OmFileReader
 # ------------------------------
 data_dir = sys.argv[1]        # z.B. "output"
 output_dir = sys.argv[2]      # z.B. "output/maps"
-var_type = sys.argv[3]        # 't2m', 'wind', ...
+var_type = sys.argv[3]        # 't2m_mean', 'wind_mean', ...  (Pipeline ruft nur noch diese beiden auf)
+# Optional: eigener Ordner fuer die *_spread .om-Dateien, falls die nicht im
+# selben Ordner wie die Mean-Dateien liegen. Faellt auf data_dir zurueck,
+# wenn nicht angegeben.
+spread_data_dir = sys.argv[4] if len(sys.argv) > 4 else data_dir
 os.makedirs(output_dir, exist_ok=True)
 
 # ------------------------------
@@ -37,6 +41,21 @@ OM_FILENAME_PATTERNS = {
 # ins WebP eingebettet werden sollen (kein separates File noetig).
 # ------------------------------
 EMBED_DATA_VARS = {"t2m_mean", "wind_mean", "t2m_spread", "wind_spread"}
+
+# ------------------------------
+# Mean-Variable -> zugehoerige Spread-Variable. Fuer diese Mean-Typen wird
+# zusaetzlich die passende *_spread .om-Datei geladen und deren Werte als
+# zweiter, separater Chunk (SPREAD_CHUNK_FOURCC) in dieselbe .webp-Datei
+# eingebettet. Es werden dadurch KEINE eigenen t2m_spread/wind_spread
+# .webp-Bilder mehr erzeugt - die Pipeline soll dieses Skript nur noch mit
+# var_type "t2m_mean" bzw. "wind_mean" aufrufen. Die *_spread .om-Dateien
+# duerfen in einem eigenen Ordner liegen, siehe sys.argv[4] (spread_data_dir).
+# ------------------------------
+MEAN_TO_SPREAD_VAR = {
+    "t2m_mean": "t2m_spread",
+    "wind_mean": "wind_spread",
+}
+SPREAD_CHUNK_FOURCC = b"DSPR"
 
 # ------------------------------
 # Temperatur-Farben
@@ -122,6 +141,7 @@ UNIT_CONVERT = {
     "t2m_mean": lambda v: v - 273.15 if np.nanmax(v) > 200 else v,  # K -> °C, nur falls noetig
     "wind_mean": lambda v: v * 3.6,  # m/s -> km/h
     "t2m_spread": lambda v: v,
+    "wind_spread": lambda v: v * 3.6,  # m/s -> km/h (gleiche Einheit wie wind_mean)
 }
 
 # Quantisierungsschritt je Variable fuer den eingebetteten DVAL-Chunk
@@ -283,7 +303,9 @@ def save_transparent_webp(data, cmap, norm, out_path):
 
 def embed_data_chunk(webp_path, data, extent_3857, quantum, fourcc=DVAL_FOURCC):
     """Hängt ein rohes Datenfeld als privaten, int16-quantisierten RIFF-Chunk
-    an ein WebP an.
+    an ein WebP an. Kann mehrfach mit unterschiedlichem `fourcc` aufgerufen
+    werden, um mehrere Datenfelder (z.B. Mean + Spread) in dieselbe Datei
+    einzubetten.
 
     data: 2D-Array (float), row0 = Norden (also bereits wie fürs Bild
           gespiegelt).
@@ -348,6 +370,48 @@ def load_valid_times(root, ntime, om_path):
     return [dt.datetime.fromtimestamp(int(t), tz=dt.timezone.utc) for t in raw]
 
 
+def load_spread_dataset(spread_var_type, spread_data_dir, expected_npoints):
+    """Sucht die zur Spread-Variable passende .om-Datei in spread_data_dir,
+    laedt sie komplett und gibt (data_all_spread[npoints, ntime],
+    {timestamp: col_index}) zurueck.
+
+    Gibt (None, {}) zurueck (statt zu werfen), wenn die Datei fehlt oder
+    nicht zum Gitter passt - der Aufrufer erzeugt dann einfach kein
+    Spread-Chunk fuer diesen Lauf, ohne den Mean-Export abzubrechen.
+    """
+    pattern = OM_FILENAME_PATTERNS[spread_var_type]
+    try:
+        spread_files = sorted(f for f in os.listdir(spread_data_dir) if f.endswith(".om"))
+    except OSError as e:
+        print(f"  Warnung: Spread-Ordner '{spread_data_dir}' nicht lesbar ({e}) - "
+              f"kein Spread-Chunk wird eingebettet")
+        return None, {}
+
+    matches = [f for f in spread_files if pattern.lower() in f.lower()]
+    if not matches:
+        print(f"  Warnung: keine {spread_var_type}-Datei in '{spread_data_dir}' gefunden "
+              f"(Muster '{pattern}') - kein Spread-Chunk wird eingebettet")
+        return None, {}
+
+    spread_path = os.path.join(spread_data_dir, matches[0])
+    with OmFileReader(spread_path) as sroot:
+        if not sroot.is_array:
+            print(f"  Warnung: {spread_path} ist kein Array - kein Spread-Chunk wird eingebettet")
+            return None, {}
+
+        _, s_npoints, s_ntime = sroot.shape
+        if s_npoints != expected_npoints:
+            print(f"  Warnung: {spread_path} hat {s_npoints} Punkte, erwartet {expected_npoints} "
+                  f"(passt nicht zum Mean-Gitter) - kein Spread-Chunk wird eingebettet")
+            return None, {}
+
+        data_all_spread = sroot.read_array((slice(0, 1), slice(0, s_npoints), slice(0, s_ntime)))[0]
+        valid_times_spread = load_valid_times(sroot, s_ntime, spread_path)
+
+    time_to_idx = {t: i for i, t in enumerate(valid_times_spread)}
+    return data_all_spread, time_to_idx
+
+
 # ------------------------------
 # Farb-/Konvertierungs-Auswahl fuer den angeforderten var_type
 # ------------------------------
@@ -377,6 +441,8 @@ if not matching_files:
     print(f"Keine .om Datei in {data_dir} gefunden, die zu '{pattern}' passt "
           f"(gefunden: {all_files_global})")
 
+spread_var_type = MEAN_TO_SPREAD_VAR.get(var_type)
+
 for filename in matching_files:
     om_path = os.path.join(data_dir, filename)
 
@@ -404,6 +470,15 @@ for filename in matching_files:
         ))[0]  # shape: (npoints, ntime)
 
         valid_times_utc = load_valid_times(root, ntime, om_path)
+
+        # Passende Spread-Datei (falls fuer diesen var_type vorgesehen)
+        # einmal pro Mean-Datei laden - nicht pro Zeitschritt neu oeffnen.
+        spread_data_all = None
+        spread_time_to_idx = {}
+        if spread_var_type is not None:
+            spread_data_all, spread_time_to_idx = load_spread_dataset(
+                spread_var_type, spread_data_dir, npoints
+            )
 
         if var_type == "t2m_spread":
             _sample_max = np.nanmax(data_all)
@@ -442,5 +517,27 @@ for filename in matching_files:
                 germany_data = crop_to_germany(render_data_merc)          # row0 = Süden
                 quantum = QUANTUM_STEP.get(var_type, 0.1)
                 embed_data_chunk(out_path, germany_data[::-1], GERMANY_CROP_EXTENT_3857, quantum)  # row0 = Norden
+
+            # Zusaetzlich: passenden Spread-Wert (gleicher Zeitstempel) als
+            # zweiten Chunk (DSPR) in dieselbe Datei einbetten - kein
+            # eigenes Spread-Bild mehr noetig.
+            if spread_data_all is not None:
+                ts = valid_times_utc[t_idx]
+                s_idx = spread_time_to_idx.get(ts)
+                if s_idx is None:
+                    print(f"  Warnung: kein {spread_var_type}-Zeitschritt fuer {ts.isoformat()} "
+                          f"gefunden - kein Spread-Chunk fuer {outname} eingebettet")
+                else:
+                    spread_convert = UNIT_CONVERT.get(spread_var_type, lambda v: v)
+                    spread_flat = spread_convert(np.asarray(spread_data_all[:, s_idx], dtype=np.float64))
+                    spread_merc = warp_o320_to_webmercator(
+                        spread_flat, _o320_lat, _o320_lon, extent, method="linear"
+                    )
+                    spread_germany = crop_to_germany(spread_merc)          # row0 = Süden
+                    spread_quantum = QUANTUM_STEP.get(spread_var_type, 0.1)
+                    embed_data_chunk(
+                        out_path, spread_germany[::-1], GERMANY_CROP_EXTENT_3857,
+                        spread_quantum, fourcc=SPREAD_CHUNK_FOURCC
+                    )
 
             print(f"{filename} t_idx={t_idx} -> {outname}")
