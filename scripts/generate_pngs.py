@@ -5,7 +5,6 @@ import zlib
 import datetime as dt
 from zoneinfo import ZoneInfo
 import numpy as np
-from scipy.special import roots_legendre
 from scipy.interpolate import griddata
 import matplotlib
 matplotlib.use("Agg")
@@ -186,31 +185,34 @@ def build_octahedral_latlon(N=GAUSSIAN_N):
     Octahedral Reduced Gaussian Grid ON, sortiert Nord->Sued, innerhalb
     jedes Rings aufsteigend in Lon ab 0 Grad.
 
-    Nicht verifiziert bzgl. exakter Punktreihenfolge/Startphase - vor
-    produktivem Einsatz mit einem Plausibilitaetscheck (z.B. Pol- vs.
-    Aequator-Punkt) gegenpruefen, siehe Kommentar unten im Hauptteil.
+    WICHTIG: Diese Formel ist 1:1 aus dem echten open-meteo-Quellcode
+    (GaussianGrid.swift, GridType.o320/.o1280) uebernommen, NICHT aus
+    einer allgemeinen Gauss-Quadratur (roots_legendre) hergeleitet.
+    open-meteo verwendet fuer die Breiten einen KONSTANTEN Winkelschritt
+    (dy = 180 / (2N + 0.5)), keine echten Gauss-Knoten - eine vorherige
+    Version dieser Funktion nutzte roots_legendre und lag dadurch bis zu
+    ~0.0044 Grad (~0.5 km, am staerksten nahe der Pole) daneben.
+    Ausserdem wird hier - wie im Original - der Laengengrad auf
+    (-180, 180] gewrapt statt in [0, 360) zu bleiben; ohne diesen Wrap
+    gingen bei einer Bounding Box mit negativem lon_min (wie hier, -3.94)
+    Punkte nahe 0 Grad West faelschlich aus der Interpolationsmaske
+    verloren (z.B. Atlantikkueste Frankreichs, Aermelkanal).
     """
-    x, _ = roots_legendre(2 * N)                  # 2N Gauss-Knoten, absteigend sortiert
-    gauss_lats = np.degrees(np.arcsin(x))[::-1]    # Nord -> Sued (90 .. -90)
+    L = N
+    dy = 180.0 / (2 * L + 0.5)
 
     lats_full = []
     lons_full = []
-
-    # Nordhalbkugel: Ring j=1 (polnah) bis j=N (aequatornah)
-    for j in range(1, N + 1):
-        pl = 4 * j + 16
-        lat_n = gauss_lats[j - 1]
-        lon_n = np.arange(pl) * (360.0 / pl)
-        lats_full.append(np.full(pl, lat_n))
-        lons_full.append(lon_n)
-
-    # Suedhalbkugel: spiegelbildlich, j=N (aequatornah) bis j=1 (polnah)
-    for j in range(N, 0, -1):
-        pl = 4 * j + 16
-        lat_s = gauss_lats[2 * N - j]
-        lon_s = np.arange(pl) * (360.0 / pl)
-        lats_full.append(np.full(pl, lat_s))
-        lons_full.append(lon_s)
+    for y in range(2 * L):
+        # nx pro Zeile: Nordhalbkugel (y < L) steigend 20,24,28,...;
+        # Suedhalbkugel spiegelbildlich fallend - identisch zu
+        # GridType.nxOf(y:) im Swift-Code.
+        nx = (20 + y * 4) if y < L else ((2 * L - y - 1) * 4 + 20)
+        lat = (L - y - 1) * dy + dy / 2
+        lon = np.arange(nx) * (360.0 / nx)
+        lon = np.where(lon >= 180, lon - 360, lon)  # wrap wie im Original
+        lats_full.append(np.full(nx, lat))
+        lons_full.append(lon)
 
     lat = np.concatenate(lats_full)
     lon = np.concatenate(lons_full)
