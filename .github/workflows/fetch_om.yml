@@ -81,8 +81,8 @@ jobs:
     needs: fetch_and_generate
     strategy:
       matrix:
-        variable: [t2m_mean, wind_mean, t2m_spread, wind_spread]
-      max-parallel: 4
+        variable: [t2m_mean, wind_mean]
+      max-parallel: 2
     steps:
       - name: Checkout Repo
         uses: actions/checkout@v3
