@@ -181,23 +181,6 @@ GAUSSIAN_N = 320  # aus crs_wkt-REMARK "Reduced Gaussian Grid O320" abgelesen
 
 
 def build_octahedral_latlon(N=GAUSSIAN_N):
-    """Baut lat/lon-Arrays (Laenge = 2*sum(4j+16, j=1..N)) fuer ein ECMWF
-    Octahedral Reduced Gaussian Grid ON, sortiert Nord->Sued, innerhalb
-    jedes Rings aufsteigend in Lon ab 0 Grad.
-
-    WICHTIG: Diese Formel ist 1:1 aus dem echten open-meteo-Quellcode
-    (GaussianGrid.swift, GridType.o320/.o1280) uebernommen, NICHT aus
-    einer allgemeinen Gauss-Quadratur (roots_legendre) hergeleitet.
-    open-meteo verwendet fuer die Breiten einen KONSTANTEN Winkelschritt
-    (dy = 180 / (2N + 0.5)), keine echten Gauss-Knoten - eine vorherige
-    Version dieser Funktion nutzte roots_legendre und lag dadurch bis zu
-    ~0.0044 Grad (~0.5 km, am staerksten nahe der Pole) daneben.
-    Ausserdem wird hier - wie im Original - der Laengengrad auf
-    (-180, 180] gewrapt statt in [0, 360) zu bleiben; ohne diesen Wrap
-    gingen bei einer Bounding Box mit negativem lon_min (wie hier, -3.94)
-    Punkte nahe 0 Grad West faelschlich aus der Interpolationsmaske
-    verloren (z.B. Atlantikkueste Frankreichs, Aermelkanal).
-    """
     L = N
     dy = 180.0 / (2 * L + 0.5)
 
