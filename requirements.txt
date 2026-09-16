@@ -1,9 +1,6 @@
-# Open-Meteo .om Dateiformat
-omfiles
-
-# Bildverarbeitung / Reprojektion
-numpy
-scipy
-matplotlib
-pillow
-tzdata
+matplotlib==3.11.2
+numpy==2.5.3
+omfiles==1.2.0
+pillow==12.3.0
+scipy==1.18.1
+tzdata==2026.4
