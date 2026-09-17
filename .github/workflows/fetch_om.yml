@@ -37,12 +37,12 @@ jobs:
         run: |
           HOUR=$(date -u +%H)
           case $HOUR in
-            20|21) RUN=00 ;;
+            20|21|01) RUN=00 ;;
           esac
           YEAR=$(date -u +%Y)
           MONTH=$(date -u +%m)
-          DAY=$(date -u +%d)
-          DATE=$(date -u +%Y%m%d)
+          DAY=16
+          DATE=20260916
           # set env variables
           echo "RUN=$RUN" >> $GITHUB_ENV
           echo "YEAR=$YEAR" >> $GITHUB_ENV
